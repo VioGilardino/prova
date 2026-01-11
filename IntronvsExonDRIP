@@ -1,0 +1,295 @@
+#!/usr/bin/env Rscript
+#
+# IntronvsExonDRIP.R
+#
+# Generalized DRIP BigWig -> gene exon/intron percentile table + violin plots
+#
+# Usage:
+# Rscript organize_drip.R --gtf annotations.gtf --bw-csv bw_files.csv --out-prefix DRIP_analysis
+#
+# bw_files.csv must be a CSV with columns: sample,group,bw
+#
+suppressPackageStartupMessages({
+  library(optparse)
+  library(GenomicFeatures)
+  library(GenomicRanges)
+  library(GenomeInfoDb)
+  library(rtracklayer)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+})
+
+option_list <- list(
+  make_option(c("-g", "--gtf"), type = "character", help = "GTF/GFF annotation file (required)"),
+  make_option(c("-c", "--bw-csv"), type = "character", help = "CSV with columns: sample,group,bw (required)"),
+  make_option(c("-o", "--out-prefix"), type = "character", default = "DRIP",
+              help = "Output prefix for files [default %default]"),
+  make_option(c("-p", "--percentile"), type = "double", default = 0.95,
+              help = "Percentile to use for aggregation (0-1) [default %default]"),
+  make_option(c("-m", "--min-width"), type = "integer", default = 500,
+              help = "Minimum width (bp) for intron/exon to be considered [default %default]"),
+  make_option(c("-s", "--min-signal"), type = "double", default = 1e-4,
+              help = "Pseudocount/minimum signal for filtering/plots [default %default]"),
+  make_option(c("-C", "--chromosomes"), type = "character",
+              default = "chr2L,chr2R,chr3L,chr3R,chrX,chrY,chr4",
+              help = "Comma-separated list of chromosomes to keep (UCSC style)"),
+  make_option(c("--fixed-y"), type = "character", default = "-1,2.5",
+              help = "Fixed Y limits for plots, comma separated, e.g. -1,2.5"),
+  make_option(c("--no-plot"), action = "store_true", default = FALSE,
+              help = "Do not generate plots if set")
+)
+
+opt_parser <- OptionParser(option_list = option_list)
+opt <- parse_args(opt_parser)
+
+if (is.null(opt$gtf) || is.null(opt$`bw-csv`)) {
+  print_help(opt_parser)
+  stop("Please provide --gtf and --bw-csv.", call. = FALSE)
+}
+
+GTF_FILE <- opt$gtf
+BW_CSV    <- opt$`bw-csv`
+OUT_PREFIX <- opt$`out-prefix`
+PERC <- opt$percentile
+MIN_WIDTH <- opt$`min-width`
+MIN_SIGNAL <- opt$`min-signal`
+my_chromosomes <- strsplit(opt$chromosomes, ",")[[1]]
+fixed_y <- as.numeric(strsplit(opt$`fixed-y`, ",")[[1]])
+MAKE_PLOTS <- !opt$`no-plot`
+
+cat("Parameters:\n")
+cat(" GTF:", GTF_FILE, "\n")
+cat(" BW CSV:", BW_CSV, "\n")
+cat(" Output prefix:", OUT_PREFIX, "\n")
+cat(" Percentile:", PERC, "\n")
+cat(" Min width:", MIN_WIDTH, "\n")
+cat(" Min signal (pseudocount):", MIN_SIGNAL, "\n")
+cat(" Chromosomes:", paste(my_chromosomes, collapse = ", "), "\n")
+cat(" Fixed Y limits:", paste(fixed_y, collapse = ", "), "\n")
+
+`%nin%` <- Negate(`%in%`)
+
+import_cov <- function(bw, keep = NULL) {
+  cat(" Importing BigWig:", bw, "...\n")
+  cov <- import(bw, format = "BigWig", as = "RleList")
+  if (!is.null(keep)) {
+    seqlevelsStyle(cov) <- "UCSC"
+    cov <- cov[intersect(names(cov), keep)]
+  }
+  cov
+}
+
+mean_RleList_multi <- function(rlelist_list, keep = NULL) {
+  if (length(rlelist_list) == 0) stop("Empty list in mean_RleList_multi")
+  common <- Reduce(intersect, lapply(rlelist_list, names))
+  if (!is.null(keep)) common <- intersect(common, keep)
+  if (length(common) == 0) stop("No common chromosomes across RleLists")
+  out <- rlelist_list[[1]][common]
+  for (i in seq_along(common)) {
+    chr <- common[i]
+    s <- rlelist_list[[1]][[chr]]
+    if (length(rlelist_list) > 1) {
+      for (j in 2:length(rlelist_list)) {
+        s <- s + rlelist_list[[j]][[chr]]
+      }
+    }
+    out[[chr]] <- s / length(rlelist_list)
+  }
+  out
+}
+
+agg_fun_factory <- function(p) {
+  function(x) {
+    x <- as.numeric(x)
+    x <- x[is.finite(x)]
+    if (length(x) == 0) return(NA_real_)
+    stats::quantile(x, p, na.rm = TRUE, names = FALSE)
+  }
+}
+
+cat("Reading BW CSV:", BW_CSV, "...\n")
+bwdf <- read.csv(BW_CSV, stringsAsFactors = FALSE)
+required_cols <- c("sample", "group", "bw")
+if (!all(required_cols %in% colnames(bwdf))) {
+  stop("bw_csv must contain columns: sample,group,bw")
+}
+if (any(!file.exists(bwdf$bw))) {
+  missing_files <- bwdf$bw[!file.exists(bwdf$bw)]
+  stop("Some bigWig files don't exist:\n", paste(missing_files, collapse = "\n"))
+}
+
+groups <- unique(bwdf$group)
+cat("Found groups:", paste(groups, collapse = ", "), "\n")
+
+cat("Building TxDb from GTF...\n")
+txdb <- makeTxDbFromGFF(GTF_FILE, format = "gtf")
+all_genes <- genes(txdb)
+seqlevelsStyle(all_genes) <- "UCSC"
+all_genes <- keepSeqlevels(all_genes, my_chromosomes, pruning.mode = "coarse")
+df_allgenes <- data.frame(
+  chr    = as.character(seqnames(all_genes)),
+  start  = start(all_genes) - 1L,
+  end    = end(all_genes),
+  strand = as.character(strand(all_genes)),
+  width  = width(all_genes),
+  row.names = all_genes$gene_id,
+  gene_id   = all_genes$gene_id,
+  stringsAsFactors = FALSE
+)
+
+GeneBodyFeatures <- data.frame(
+  gene_id = all_genes$gene_id,
+  cluster = "all_genes",
+  stringsAsFactors = FALSE
+)
+
+cat("Computing intronic/exonic parts from TxDb...\n")
+my_allgenes_introns <- GenomicFeatures::intronicParts(txdb)
+seqlevelsStyle(my_allgenes_introns) <- "UCSC"
+my_allgenes_introns <- keepSeqlevels(my_allgenes_introns, my_chromosomes, pruning.mode = "coarse")
+my_allgenes_introns <- as.data.frame(my_allgenes_introns)
+
+my_allgenes_exons <- GenomicFeatures::exonicParts(txdb)
+seqlevelsStyle(my_allgenes_exons) <- "UCSC"
+my_allgenes_exons <- keepSeqlevels(my_allgenes_exons, my_chromosomes, pruning.mode = "coarse")
+my_allgenes_exons <- as.data.frame(my_allgenes_exons)
+
+cat("Importing BigWig files (this may take time)...\n")
+cov_by_sample <- list()
+for (i in seq_len(nrow(bwdf))) {
+  sample <- bwdf$sample[i]
+  bwfile <- bwdf$bw[i]
+  cov_by_sample[[sample]] <- import_cov(bwfile, keep = my_chromosomes)
+}
+
+cat("Computing mean coverage per group (averaging replicates)...\n")
+cov_by_group <- list()
+for (g in groups) {
+  samples_in_group <- bwdf$sample[bwdf$group == g]
+  rlelists <- lapply(samples_in_group, function(s) cov_by_sample[[s]])
+  cov_by_group[[g]] <- mean_RleList_multi(rlelists, keep = my_chromosomes)
+  saveRDS(cov_by_group[[g]], paste0(OUT_PREFIX, ".coverage.", g, ".rds"))
+  cat(" Saved coverage for group", g, "->", paste0(OUT_PREFIX, ".coverage.", g, ".rds"), "\n")
+}
+
+cat("Building gene x (group,region) table using percentile:", PERC, "...\n")
+agg_fun <- agg_fun_factory(PERC)
+
+int_ex_table <- data.frame(
+  gene_id = GeneBodyFeatures$gene_id,
+  stringsAsFactors = FALSE
+)
+
+for (g in groups) {
+  int_ex_table[[paste0(g, "_Exon")]] <- NA_real_
+  int_ex_table[[paste0(g, "_Intron")]] <- NA_real_
+}
+
+Ngenes <- nrow(int_ex_table)
+for (k in seq_len(Ngenes)) {
+  geneid <- int_ex_table$gene_id[k]
+  my_intron_ranges <- my_allgenes_introns %>%
+    dplyr::filter(grepl(geneid, gene_id)) %>%
+    dplyr::filter(as.numeric(width) > MIN_WIDTH)
+  intron_gr <- if (nrow(my_intron_ranges) > 0) makeGRangesFromDataFrame(my_intron_ranges, keep.extra.columns = TRUE) else GRanges()
+  my_exon_ranges <- my_allgenes_exons %>%
+    dplyr::filter(grepl(geneid, gene_id)) %>%
+    dplyr::filter(as.numeric(width) > MIN_WIDTH)
+  exon_gr <- if (nrow(my_exon_ranges) > 0) makeGRangesFromDataFrame(my_exon_ranges, keep.extra.columns = TRUE) else GRanges()
+  for (g in groups) {
+    covg <- cov_by_group[[g]]
+    if (length(intron_gr) > 0) {
+      val <- tryCatch(agg_fun(unlist(covg[intron_gr])), error = function(e) NA_real_)
+      int_ex_table[[paste0(g, "_Intron")]][k] <- val
+    }
+    if (length(exon_gr) > 0) {
+      val <- tryCatch(agg_fun(unlist(covg[exon_gr])), error = function(e) NA_real_)
+      int_ex_table[[paste0(g, "_Exon")]][k] <- val
+    }
+  }
+  if (k %% 500 == 0) cat("  ...", k, "genes processed\n")
+}
+
+exon_cols <- grep("_Exon$", colnames(int_ex_table), value = TRUE)
+intron_cols <- grep("_Intron$", colnames(int_ex_table), value = TRUE)
+if (length(exon_cols) > 0) {
+  int_ex_table$All_Exon <- rowMeans(int_ex_table[, exon_cols], na.rm = TRUE)
+}
+if (length(intron_cols) > 0) {
+  int_ex_table$All_Intron <- rowMeans(int_ex_table[, intron_cols], na.rm = TRUE)
+}
+
+rds_out <- paste0(OUT_PREFIX, ".Int_Ex_table_q", round(PERC*100), ".rds")
+csv_out <- paste0(OUT_PREFIX, ".Int_Ex_table_q", round(PERC*100), ".csv")
+saveRDS(int_ex_table, rds_out)
+write.csv(int_ex_table, csv_out, row.names = FALSE)
+cat("Saved gene table ->", rds_out, "and", csv_out, "\n")
+
+if (MAKE_PLOTS) {
+  cat("Generating violin plots...\n")
+  long_cols <- c()
+  for (g in groups) {
+    long_cols <- c(long_cols, paste0(g, "_Exon"), paste0(g, "_Intron"))
+  }
+  df_DRIP <- int_ex_table %>%
+    left_join(GeneBodyFeatures, by = "gene_id") %>%
+    pivot_longer(
+      cols = all_of(long_cols),
+      names_to = "category",
+      values_to = "signal"
+    ) %>%
+    mutate(
+      Condition = sub("_(Exon|Intron)$", "", category),
+      Region = ifelse(grepl("Exon$", category), "Exon", "Intron")
+    )
+  df_DRIP_filt <- df_DRIP %>%
+    group_by(gene_id) %>%
+    filter(any(signal > MIN_SIGNAL, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(signal_log10 = log10(signal + MIN_SIGNAL))
+  p1_file <- paste0(OUT_PREFIX, "_Groups_ExonIntron_violin_log10_q", round(PERC*100), ".pdf")
+  pdf(p1_file, width = 10, height = 7.5)
+  print(
+    ggplot(df_DRIP_filt, aes(x = Condition, y = signal_log10, fill = Region)) +
+      geom_violin(alpha = 0.7, draw_quantiles = c(0.5), trim = TRUE) +
+      scale_fill_manual(values = c("Exon" = "#999999", "Intron" = "#E69F00")) +
+      theme_minimal() +
+      ylab(paste0("log10( signal (", round(PERC*100), "th perc) + ", MIN_SIGNAL, " )")) +
+      ggtitle(paste0(OUT_PREFIX, " – Groups: Exon vs Intron (log10)")) +
+      theme(strip.background = element_rect(colour = NA, fill = "grey95"), panel.grid.minor = element_blank()) +
+      coord_cartesian(ylim = fixed_y)
+  )
+  dev.off()
+  cat("Saved plot:", p1_file, "\n")
+
+  if ("All_Exon" %in% colnames(int_ex_table) && "All_Intron" %in% colnames(int_ex_table)) {
+    df_merge <- int_ex_table %>%
+      left_join(GeneBodyFeatures, by = "gene_id") %>%
+      transmute(
+        gene_id,
+        cluster,
+        Exon = All_Exon,
+        Intron = All_Intron
+      ) %>%
+      pivot_longer(cols = c(Exon, Intron), names_to = "Region", values_to = "signal") %>%
+      filter(signal > MIN_SIGNAL) %>%
+      mutate(signal_log10 = log10(signal + MIN_SIGNAL))
+    p2_file <- paste0(OUT_PREFIX, "_AllGroups_ExonIntron_violin_log10_q", round(PERC*100), ".pdf")
+    pdf(p2_file, width = 8, height = 6)
+    print(
+      ggplot(df_merge, aes(x = Region, y = signal_log10, fill = Region)) +
+        geom_violin(alpha = 0.7, draw_quantiles = c(0.5), trim = TRUE) +
+        coord_cartesian(ylim = fixed_y) +
+        scale_fill_manual(values = c("Exon" = "#999999", "Intron" = "#E69F00")) +
+        theme_minimal() +
+        ylab(paste0("log10( signal (", round(PERC*100), "th perc) + ", MIN_SIGNAL, " )")) +
+        ggtitle(paste0(OUT_PREFIX, " – All groups merged (log10)")) +
+        theme(panel.grid.minor = element_blank())
+    )
+    dev.off()
+    cat("Saved plot:", p2_file, "\n")
+  }
+}
+
+cat("Done.\n")
