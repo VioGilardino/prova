@@ -1,0 +1,22 @@
+# R and RStudio
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Rproj.user/
+.Rproj
+.Renviron
+
+# R package build
+.Rcheck/
+_NAUTS/
+
+# Common
+.DS_Store
+*.log
+
+# Binary outputs
+*.pdf
+*.png
+*.rds
+*.RData
