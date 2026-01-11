@@ -1,0 +1,4 @@
+sample,group,bw
+rep1_ctrl,control,/path/to/rep1_ctrl.bw
+rep2_ctrl,control,/path/to/rep2_ctrl.bw
+rep1_treat,treatment,/path/to/rep1_treat.bw
